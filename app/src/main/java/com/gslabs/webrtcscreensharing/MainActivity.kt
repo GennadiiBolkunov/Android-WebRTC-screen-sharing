@@ -72,13 +72,13 @@ import org.webrtc.VideoTrack
 import java.util.concurrent.Executors
 
 private const val TAG = "WebRtcScreenShare"
-private const val TARGET_CAPTURE_WIDTH = 1920
-private const val TARGET_CAPTURE_HEIGHT = 1072
+private const val TARGET_CAPTURE_WIDTH = 1280
+private const val TARGET_CAPTURE_HEIGHT = 720
 private const val TARGET_CAPTURE_FPS = 30
 private const val TARGET_VIDEO_MAX_BITRATE_BPS = 4_000_000
-private const val TARGET_VIDEO_MIN_BITRATE_BPS = 800_000
+private const val TARGET_VIDEO_MIN_BITRATE_BPS = 1_600_000
 private const val ENABLE_MIC_AUDIO = false
-private const val USE_SOFTWARE_VIDEO_ENCODER = true
+private const val USE_SOFTWARE_VIDEO_ENCODER = false
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -458,6 +458,45 @@ private class WebRtcScreenShareClient(
             .setVideoEncoderFactory(encoderFactory)
             .setVideoDecoderFactory(decoderFactory)
             .createPeerConnectionFactory()
+
+        logCodecSupport()
+    }
+
+    private fun logCodecSupport() {
+        val factory = peerConnectionFactory ?: return
+
+        val videoCapabilities = runCatching {
+            factory.getRtpSenderCapabilities(MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO)
+        }.getOrNull()
+
+        val audioCapabilities = runCatching {
+            factory.getRtpSenderCapabilities(MediaStreamTrack.MediaType.MEDIA_TYPE_AUDIO)
+        }.getOrNull()
+
+        val videoCodecs = videoCapabilities
+            ?.codecs
+            ?.mapNotNull { it.name }
+            ?.filter { it.isNotBlank() }
+            ?.distinctBy { it.lowercase() }
+            ?: emptyList()
+
+        val audioCodecs = audioCapabilities
+            ?.codecs
+            ?.mapNotNull { it.name }
+            ?.filter { it.isNotBlank() }
+            ?.distinctBy { it.lowercase() }
+            ?: emptyList()
+
+        val hasH264 = videoCodecs.any { it.equals("H264", ignoreCase = true) }
+        val hasOpus = audioCodecs.any { it.equals("opus", ignoreCase = true) }
+        hasH264SenderCodec = hasH264
+
+        log("INFO", "Sender video codecs: ${if (videoCodecs.isEmpty()) "<none>" else videoCodecs.joinToString()} ; H264 supported=$hasH264")
+        log("INFO", "Sender audio codecs: ${if (audioCodecs.isEmpty()) "<none>" else audioCodecs.joinToString()} ; OPUS supported=$hasOpus")
+
+        if (!hasH264) {
+            log("WARN", "H264 отсутствует в RTP sender capabilities (текущая библиотека/сборка/устройство). Будет использован доступный видеокодек из списка.")
+        }
     }
 
     private fun createPeerConnectionIfNeeded() {
@@ -520,9 +559,9 @@ private class WebRtcScreenShareClient(
                 if (sdp == null) return
 
                 val preferredSdp = sdp.description
-                    .let { current ->
+                                        .let { current ->
                         if (hasH264SenderCodec) {
-                            current.forceVideoCodecOnly(codec = "H264")
+                            current.preferCodec(codec = "H264", mediaType = "video")
                         } else {
                             current
                         }
@@ -538,7 +577,7 @@ private class WebRtcScreenShareClient(
                                 .put("sdp", localDescription.description)
                                 .toString()
                         )
-                        log("INFO", if (hasH264SenderCodec) "Offer отправлен (audio=${if (ENABLE_MIC_AUDIO) "OPUS" else "OFF"}, video=H264 ONLY)" else "Offer отправлен (audio=${if (ENABLE_MIC_AUDIO) "OPUS" else "OFF"}, video=H264 unavailable on this device/build)")
+                        log("INFO", if (hasH264SenderCodec) "Offer отправлен (audio=${if (ENABLE_MIC_AUDIO) "OPUS" else "OFF"}, video=H264 preferred)" else "Offer отправлен (audio=${if (ENABLE_MIC_AUDIO) "OPUS" else "OFF"}, video=H264 unavailable on this device/build)")
                     }
 
                     override fun onCreateFailure(error: String?) = Unit
@@ -591,74 +630,6 @@ private class WebRtcScreenShareClient(
         lines[mediaLineIndex] = updatedMediaLine
 
         return lines.joinToString("\r\n")
-    }
-
-    private fun String.forceVideoCodecOnly(codec: String): String {
-        val lines = split("\r\n").toMutableList()
-        val videoLineIndex = lines.indexOfFirst { it.startsWith("m=video ") }
-        if (videoLineIndex == -1) {
-            return this
-        }
-
-        val codecPayloadRegex = Regex("^a=rtpmap:(\\d+)\\s+${Regex.escape(codec)}/", RegexOption.IGNORE_CASE)
-        val allRtpmapPayloads = mutableSetOf<String>()
-        val desiredPayloads = mutableSetOf<String>()
-
-        lines.forEach { line ->
-            val m = Regex("^a=rtpmap:(\\d+)\\s+").find(line) ?: return@forEach
-            val payload = m.groupValues[1]
-            allRtpmapPayloads.add(payload)
-            if (codecPayloadRegex.containsMatchIn(line)) {
-                desiredPayloads.add(payload)
-            }
-        }
-
-        if (desiredPayloads.isEmpty()) {
-            log("WARN", "Cannot force H264-only SDP: no H264 payload in local offer")
-            return this
-        }
-
-        // Keep RTX payloads whose apt points to desired codec payloads
-        val aptRegex = Regex("^a=fmtp:(\\d+)\\s+.*apt=(\\d+)")
-        lines.forEach { line ->
-            val m = aptRegex.find(line) ?: return@forEach
-            val payload = m.groupValues[1]
-            val apt = m.groupValues[2]
-            if (apt in desiredPayloads) {
-                desiredPayloads.add(payload)
-            }
-        }
-
-        val mParts = lines[videoLineIndex].split(" ").toMutableList()
-        if (mParts.size <= 3) return this
-
-        val filteredPayloads = mParts.drop(3).filter { it in desiredPayloads }
-        if (filteredPayloads.isEmpty()) {
-            log("WARN", "Cannot force H264-only SDP: no matching payloads in m=video")
-            return this
-        }
-
-        lines[videoLineIndex] = (mParts.take(3) + filteredPayloads).joinToString(" ")
-
-        // Remove fmtp/rtcp-fb for dropped payloads
-        val keptSet = filteredPayloads.toSet()
-        val attrPayloadRegex = Regex("^a=(rtpmap|fmtp|rtcp-fb):(\\d+)\\b")
-        val cleaned = lines.filterNot { line ->
-            val m = attrPayloadRegex.find(line) ?: return@filterNot false
-            val payload = m.groupValues[2]
-            payload in allRtpmapPayloads && payload !in keptSet
-        }
-
-        log("INFO", "Forced video codec in SDP: $codec payloads=${filteredPayloads.joinToString()}")
-        return cleaned.joinToString("\r\n")
-    }
-
-    private fun extractSelectedVideoCodecFromAnswerSdp(sdp: String): String? {
-        val lines = sdp.split("\r\n")
-        val mVideo = lines.firstOrNull { it.startsWith("m=video ") } ?: return null
-        val payload = mVideo.split(" ").drop(3).firstOrNull() ?: return null
-        val rtp = lines.firstOrNull { it.startsWith("a=rtpmap:$payload ") } ?: return null
-        return rtp.substringAfter(" ").substringBefore("/")
     }
 
     private fun handleSignalingPayload(payload: String) {
@@ -753,11 +724,7 @@ private class WebRtcScreenShareClient(
                 peerConnection?.setRemoteDescription(object : org.webrtc.SdpObserver {
                     override fun onCreateSuccess(p0: SessionDescription?) = Unit
                     override fun onSetSuccess() {
-                        val selectedCodec = extractSelectedVideoCodecFromAnswerSdp(sdp)
-                        log("INFO", "Remote answer установлен. Selected video codec=${selectedCodec ?: "unknown"}")
-                        if (!selectedCodec.equals("H264", ignoreCase = true)) {
-                            log("WARN", "Remote did not select H264. Selected=$selectedCodec")
-                        }
+                        log("INFO", "Remote answer установлен")
                         flushPendingCandidates()
                     }
 
@@ -770,19 +737,13 @@ private class WebRtcScreenShareClient(
 
             "ice-candidate" -> {
                 val candidateJson = message.optJSONObject("candidate") ?: run {
-                    log("INFO", "Received end-of-candidates from server")
+                    log("WARN", "Пустой ICE candidate")
                     return
                 }
-                val candidateSdp = candidateJson.optString("candidate")
-                if (candidateSdp.isBlank()) {
-                    log("INFO", "Received empty ICE candidate marker from server")
-                    return
-                }
-
                 val candidate = IceCandidate(
                     candidateJson.optString("sdpMid"),
                     candidateJson.optInt("sdpMLineIndex", 0),
-                    candidateSdp
+                    candidateJson.optString("candidate")
                 )
 
                 val pc = peerConnection
