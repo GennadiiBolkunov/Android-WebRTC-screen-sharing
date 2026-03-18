@@ -4,9 +4,11 @@ import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.media.projection.MediaProjectionManager
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.provider.Settings
 import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -61,7 +63,6 @@ import org.webrtc.MediaConstraints
 import org.webrtc.MediaStreamTrack
 import org.webrtc.PeerConnection
 import org.webrtc.PeerConnectionFactory
-import org.webrtc.RtpParameters
 import org.webrtc.RtpReceiver
 import org.webrtc.ScreenCapturerAndroid
 import org.webrtc.SessionDescription
@@ -84,7 +85,6 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-
         setContent {
             WebRTCScreenSharingTheme {
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
@@ -97,8 +97,9 @@ class MainActivity : ComponentActivity() {
 
 private enum class ConnectionState {
     DISCONNECTED,
-    CONNECTING,
-    CONNECTED,
+    CONNECTING,       // WS connecting
+    WAITING_ACCESS,   // WS open, request-access sent, waiting for grant/deny
+    CONNECTED,        // access-granted received
     STREAMING
 }
 
@@ -113,7 +114,7 @@ private fun ScreenShareApp(modifier: Modifier = Modifier) {
     val coroutineScope = rememberCoroutineScope()
     val logs = remember { mutableStateListOf<UiLog>() }
     var state by remember { mutableStateOf(ConnectionState.DISCONNECTED) }
-    var wsUrl by remember { mutableStateOf("ws://192.168.0.138:8554") }
+    var wsUrl by remember { mutableStateOf("ws://192.168.0.137:8554") }
 
     val client = remember {
         WebRtcScreenShareClient(
@@ -123,6 +124,12 @@ private fun ScreenShareApp(modifier: Modifier = Modifier) {
             },
             onConnected = {
                 state = ConnectionState.CONNECTED
+            },
+            onWaitingAccess = {
+                state = ConnectionState.WAITING_ACCESS
+            },
+            onAccessDenied = {
+                state = ConnectionState.DISCONNECTED
             },
             onDisconnected = {
                 state = ConnectionState.DISCONNECTED
@@ -146,9 +153,7 @@ private fun ScreenShareApp(modifier: Modifier = Modifier) {
     }
 
     DisposableEffect(Unit) {
-        onDispose {
-            client.release()
-        }
+        onDispose { client.release() }
     }
 
     Column(
@@ -186,7 +191,8 @@ private fun ScreenShareApp(modifier: Modifier = Modifier) {
 
             Button(
                 onClick = {
-                    val manager = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                    val manager = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE)
+                            as MediaProjectionManager
                     projectionLauncher.launch(manager.createScreenCaptureIntent())
                 },
                 enabled = state == ConnectionState.CONNECTED
@@ -225,6 +231,8 @@ private class WebRtcScreenShareClient(
     private val appContext: Context,
     private val onLog: (String, String) -> Unit,
     private val onConnected: () -> Unit,
+    private val onWaitingAccess: () -> Unit,
+    private val onAccessDenied: () -> Unit,
     private val onDisconnected: () -> Unit,
     private val onStreamingChanged: (Boolean) -> Unit
 ) {
@@ -247,8 +255,35 @@ private class WebRtcScreenShareClient(
     private val pendingRemoteCandidates = mutableListOf<IceCandidate>()
     private var hasH264SenderCodec: Boolean = false
 
+    @Volatile
+    private var accessState: AccessState = AccessState.IDLE
+
+    private enum class AccessState { IDLE, PENDING, GRANTED }
+
     init {
         initializePeerConnectionFactory()
+    }
+
+    private fun resolveDeviceName(): String {
+        // 1. User-visible Bluetooth / device name (Android 8+)
+        val bluetoothName = runCatching {
+            Settings.Global.getString(appContext.contentResolver, "bluetooth_name")
+                ?.takeIf { it.isNotBlank() }
+        }.getOrNull()
+        if (bluetoothName != null) return bluetoothName
+
+        // 2. device_name setting (some OEMs)
+        val settingName = runCatching {
+            Settings.Global.getString(appContext.contentResolver, Settings.Global.DEVICE_NAME)
+                ?.takeIf { it.isNotBlank() }
+        }.getOrNull()
+        if (settingName != null) return settingName
+
+        // 3. Fallback: manufacturer + model
+        val manufacturer = Build.MANUFACTURER.replaceFirstChar { it.uppercase() }
+        val model = Build.MODEL
+        return if (model.startsWith(manufacturer, ignoreCase = true)) model
+        else "$manufacturer $model"
     }
 
     fun connect(url: String) {
@@ -257,12 +292,20 @@ private class WebRtcScreenShareClient(
             return
         }
 
+        accessState = AccessState.IDLE
         val request = Request.Builder().url(url).build()
         webSocket = okHttpClient.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
-                log("INFO", "WebSocket подключен")
-                createPeerConnectionIfNeeded()
-                dispatchMain(onConnected)
+                log("INFO", "WebSocket подключен — отправляем request-access")
+                accessState = AccessState.PENDING
+                val deviceName = resolveDeviceName()
+                sendMessage(
+                    JSONObject()
+                        .put("type", "request-access")
+                        .put("deviceName", deviceName)
+                        .toString()
+                )
+                dispatchMain(onWaitingAccess)
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
@@ -290,6 +333,11 @@ private class WebRtcScreenShareClient(
     }
 
     suspend fun startScreenShare(permissionData: Intent) {
+        if (accessState != AccessState.GRANTED) {
+            log("WARN", "Нельзя начать трансляцию: доступ ещё не получен (state=$accessState)")
+            return
+        }
+
         withContext(Dispatchers.IO) {
             val pc = peerConnection ?: run {
                 log("ERROR", "PeerConnection не готов")
@@ -301,26 +349,32 @@ private class WebRtcScreenShareClient(
                 return@withContext
             }
 
-            val capturer = ScreenCapturerAndroid(permissionData, object : android.media.projection.MediaProjection.Callback() {
-                override fun onStop() {
-                    log("WARN", "MediaProjection остановлен системой")
-                    stopStreaming()
+            val capturer = ScreenCapturerAndroid(
+                permissionData,
+                object : android.media.projection.MediaProjection.Callback() {
+                    override fun onStop() {
+                        log("WARN", "MediaProjection остановлен системой")
+                        stopStreaming()
+                    }
                 }
-            })
+            )
 
             ProjectionForegroundService.start(appContext)
 
             val source = peerConnectionFactory!!.createVideoSource(capturer.isScreencast)
-            val helper = SurfaceTextureHelper.create("ScreenCaptureThread", eglBase!!.eglBaseContext)
+            val helper = SurfaceTextureHelper.create(
+                "ScreenCaptureThread",
+                eglBase!!.eglBaseContext
+            )
             capturer.initialize(helper, appContext, source.capturerObserver)
             try {
                 capturer.startCapture(TARGET_CAPTURE_WIDTH, TARGET_CAPTURE_HEIGHT, TARGET_CAPTURE_FPS)
-            } catch (securityException: SecurityException) {
-                log("ERROR", "MediaProjection requires foreground service type MEDIA_PROJECTION: ${securityException.message}")
+            } catch (e: SecurityException) {
+                log("ERROR", "MediaProjection requires foreground service type MEDIA_PROJECTION: ${e.message}")
                 ProjectionForegroundService.stop(appContext)
                 return@withContext
-            } catch (throwable: Throwable) {
-                log("ERROR", "Failed to start screen capture: ${throwable.message}")
+            } catch (e: Throwable) {
+                log("ERROR", "Failed to start screen capture: ${e.message}")
                 ProjectionForegroundService.stop(appContext)
                 return@withContext
             }
@@ -358,12 +412,11 @@ private class WebRtcScreenShareClient(
     }
 
     private fun configureVideoSenderBitrate(pc: PeerConnection) {
-        val videoSender = pc.senders.firstOrNull { sender ->
-            sender.track()?.kind() == MediaStreamTrack.VIDEO_TRACK_KIND
-        } ?: run {
-            log("WARN", "Video sender not found for bitrate configuration")
-            return
-        }
+        val videoSender = pc.senders.firstOrNull { it.track()?.kind() == MediaStreamTrack.VIDEO_TRACK_KIND }
+            ?: run {
+                log("WARN", "Video sender not found for bitrate configuration")
+                return
+            }
 
         val parameters = videoSender.parameters
         val encodings = parameters.encodings
@@ -375,11 +428,8 @@ private class WebRtcScreenShareClient(
         encodings.forEachIndexed { index, encoding ->
             encoding.maxBitrateBps = TARGET_VIDEO_MAX_BITRATE_BPS
             encoding.minBitrateBps = TARGET_VIDEO_MIN_BITRATE_BPS
-            encoding.maxFramerate = TARGET_CAPTURE_FPS
-            log(
-                "INFO",
-                "Configured encoding[$index]: min=${encoding.minBitrateBps}, max=${encoding.maxBitrateBps}, fps=${encoding.maxFramerate}"
-            )
+            encoding.maxFramerate  = TARGET_CAPTURE_FPS
+            log("INFO", "Configured encoding[$index]: min=${encoding.minBitrateBps}, max=${encoding.maxBitrateBps}, fps=${encoding.maxFramerate}")
         }
 
         val success = videoSender.setParameters(parameters)
@@ -388,9 +438,7 @@ private class WebRtcScreenShareClient(
 
     fun stopStreaming() {
         executor.execute {
-            runCatching { screenCapturer?.stopCapture() }
-                .onFailure { log("WARN", "stopCapture: ${it.message}") }
-
+            runCatching { screenCapturer?.stopCapture() }.onFailure { log("WARN", "stopCapture: ${it.message}") }
             runCatching { screenCapturer?.dispose() }
             runCatching { videoTrack?.dispose() }
             runCatching { videoSource?.dispose() }
@@ -398,17 +446,15 @@ private class WebRtcScreenShareClient(
             runCatching { audioSource?.dispose() }
             runCatching { surfaceTextureHelper?.dispose() }
 
-            screenCapturer = null
-            videoTrack = null
-            videoSource = null
-            audioTrack = null
-            audioSource = null
+            screenCapturer    = null
+            videoTrack        = null
+            videoSource       = null
+            audioTrack        = null
+            audioSource       = null
             surfaceTextureHelper = null
 
             runCatching {
-                peerConnection?.senders?.forEach { sender ->
-                    peerConnection?.removeTrack(sender)
-                }
+                peerConnection?.senders?.forEach { peerConnection?.removeTrack(it) }
             }
 
             ProjectionForegroundService.stop(appContext)
@@ -420,15 +466,14 @@ private class WebRtcScreenShareClient(
     fun release() {
         stopStreaming()
         cleanupConnection()
-
         executor.execute {
             runCatching { peerConnection?.close() }
             runCatching { peerConnection?.dispose() }
             runCatching { peerConnectionFactory?.dispose() }
             runCatching { eglBase?.release() }
-            peerConnection = null
+            peerConnection        = null
             peerConnectionFactory = null
-            eglBase = null
+            eglBase               = null
             executor.shutdown()
         }
     }
@@ -441,7 +486,6 @@ private class WebRtcScreenShareClient(
 
         eglBase = EglBase.create()
 
-        val options = PeerConnectionFactory.Options()
         val encoderFactory = if (USE_SOFTWARE_VIDEO_ENCODER) {
             SoftwareVideoEncoderFactory().also {
                 log("WARN", "Using SOFTWARE video encoder factory (H264 may be unavailable in sender capabilities)")
@@ -451,12 +495,11 @@ private class WebRtcScreenShareClient(
                 log("INFO", "Using default hardware-capable video encoder factory")
             }
         }
-        val decoderFactory = DefaultVideoDecoderFactory(eglBase!!.eglBaseContext)
 
         peerConnectionFactory = PeerConnectionFactory.builder()
-            .setOptions(options)
+            .setOptions(PeerConnectionFactory.Options())
             .setVideoEncoderFactory(encoderFactory)
-            .setVideoDecoderFactory(decoderFactory)
+            .setVideoDecoderFactory(DefaultVideoDecoderFactory(eglBase!!.eglBaseContext))
             .createPeerConnectionFactory()
 
         logCodecSupport()
@@ -465,87 +508,78 @@ private class WebRtcScreenShareClient(
     private fun logCodecSupport() {
         val factory = peerConnectionFactory ?: return
 
-        val videoCapabilities = runCatching {
+        val videoCodecs = runCatching {
             factory.getRtpSenderCapabilities(MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO)
-        }.getOrNull()
+                .codecs.mapNotNull { it.name }.filter { it.isNotBlank() }.distinctBy { it.lowercase() }
+        }.getOrElse { emptyList() }
 
-        val audioCapabilities = runCatching {
+        val audioCodecs = runCatching {
             factory.getRtpSenderCapabilities(MediaStreamTrack.MediaType.MEDIA_TYPE_AUDIO)
-        }.getOrNull()
-
-        val videoCodecs = videoCapabilities
-            ?.codecs
-            ?.mapNotNull { it.name }
-            ?.filter { it.isNotBlank() }
-            ?.distinctBy { it.lowercase() }
-            ?: emptyList()
-
-        val audioCodecs = audioCapabilities
-            ?.codecs
-            ?.mapNotNull { it.name }
-            ?.filter { it.isNotBlank() }
-            ?.distinctBy { it.lowercase() }
-            ?: emptyList()
+                .codecs.mapNotNull { it.name }.filter { it.isNotBlank() }.distinctBy { it.lowercase() }
+        }.getOrElse { emptyList() }
 
         val hasH264 = videoCodecs.any { it.equals("H264", ignoreCase = true) }
         val hasOpus = audioCodecs.any { it.equals("opus", ignoreCase = true) }
         hasH264SenderCodec = hasH264
 
-        log("INFO", "Sender video codecs: ${if (videoCodecs.isEmpty()) "<none>" else videoCodecs.joinToString()} ; H264 supported=$hasH264")
-        log("INFO", "Sender audio codecs: ${if (audioCodecs.isEmpty()) "<none>" else audioCodecs.joinToString()} ; OPUS supported=$hasOpus")
-
-        if (!hasH264) {
-            log("WARN", "H264 отсутствует в RTP sender capabilities (текущая библиотека/сборка/устройство). Будет использован доступный видеокодек из списка.")
-        }
+        log("INFO", "Sender video codecs: ${videoCodecs.ifEmpty { listOf("<none>") }.joinToString()} ; H264=$hasH264")
+        log("INFO", "Sender audio codecs: ${audioCodecs.ifEmpty { listOf("<none>") }.joinToString()} ; OPUS=$hasOpus")
+        if (!hasH264) log("WARN", "H264 отсутствует в RTP sender capabilities — будет использован доступный кодек")
     }
 
     private fun createPeerConnectionIfNeeded() {
         if (peerConnection != null) return
 
         val rtcConfig = PeerConnection.RTCConfiguration(
-            listOf(PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer())
+            listOf()
         )
 
-        peerConnection = peerConnectionFactory?.createPeerConnection(rtcConfig, object : PeerConnection.Observer {
-            override fun onSignalingChange(newState: PeerConnection.SignalingState) {
-                log("INFO", "Signaling state: $newState")
+        peerConnection = peerConnectionFactory?.createPeerConnection(
+            rtcConfig,
+            object : PeerConnection.Observer {
+                override fun onSignalingChange(s: PeerConnection.SignalingState)        { log("INFO", "Signaling: $s") }
+                override fun onIceConnectionChange(s: PeerConnection.IceConnectionState){ log("INFO", "ICE: $s") }
+                override fun onIceConnectionReceivingChange(r: Boolean)                 = Unit
+                override fun onIceGatheringChange(s: PeerConnection.IceGatheringState)  { log("INFO", "Gathering: $s") }
+                override fun onIceCandidate(c: IceCandidate)                            { sendIceCandidate(c) }
+                override fun onIceCandidatesRemoved(c: Array<out IceCandidate>)         = Unit
+                override fun onAddStream(s: org.webrtc.MediaStream)                     = Unit
+                override fun onRemoveStream(s: org.webrtc.MediaStream)                  = Unit
+                override fun onDataChannel(d: org.webrtc.DataChannel)                   = Unit
+                override fun onRenegotiationNeeded()                                    { log("INFO", "Renegotiation needed") }
+                override fun onAddTrack(r: RtpReceiver, s: Array<out org.webrtc.MediaStream>) = Unit
+                override fun onConnectionChange(s: PeerConnection.PeerConnectionState)  {
+                    log("INFO", "Connection: $s")
+                    if (s == PeerConnection.PeerConnectionState.CONNECTED) {
+                        // Принудительно сгенерировать новый keyframe
+                        // через временное изменение bitrate (вызывает keyframe в большинстве энкодеров)
+                        executor.execute { requestKeyframe() }
+                    }
+                }
+
+                private fun requestKeyframe() {
+                    val sender = peerConnection?.senders
+                        ?.firstOrNull { it.track()?.kind() == MediaStreamTrack.VIDEO_TRACK_KIND }
+                        ?: return
+                    val params = sender.parameters
+                    if (params.encodings.isNullOrEmpty()) return
+                    // Временно роняем битрейт до минимума — энкодер сгенерирует keyframe
+                    val originalMax = params.encodings[0].maxBitrateBps
+                    params.encodings[0].maxBitrateBps = 100_000
+                    sender.setParameters(params)
+                    // Через 100мс восстанавливаем
+                    mainHandler.postDelayed({
+                        executor.execute {
+                            val p2 = sender.parameters
+                            if (!p2.encodings.isNullOrEmpty()) {
+                                p2.encodings[0].maxBitrateBps = originalMax
+                                sender.setParameters(p2)
+                            }
+                        }
+                    }, 100)
+                }
             }
-
-            override fun onIceConnectionChange(newState: PeerConnection.IceConnectionState) {
-                log("INFO", "ICE state: $newState")
-            }
-
-            override fun onIceConnectionReceivingChange(receiving: Boolean) = Unit
-
-            override fun onIceGatheringChange(newState: PeerConnection.IceGatheringState) {
-                log("INFO", "ICE gathering: $newState")
-            }
-
-            override fun onIceCandidate(candidate: IceCandidate) {
-                sendIceCandidate(candidate)
-            }
-
-            override fun onIceCandidatesRemoved(candidates: Array<out IceCandidate>) = Unit
-
-            override fun onAddStream(stream: org.webrtc.MediaStream) = Unit
-
-            override fun onRemoveStream(stream: org.webrtc.MediaStream) = Unit
-
-            override fun onDataChannel(dataChannel: org.webrtc.DataChannel) = Unit
-
-            override fun onRenegotiationNeeded() {
-                log("INFO", "Renegotiation needed")
-            }
-
-            override fun onAddTrack(receiver: RtpReceiver, mediaStreams: Array<out org.webrtc.MediaStream>) = Unit
-
-
-            override fun onConnectionChange(newState: PeerConnection.PeerConnectionState) {
-                log("INFO", "Connection state: $newState")
-            }
-
-
-        })
+        )
     }
 
     private fun createAndSendOffer(pc: PeerConnection) {
@@ -557,245 +591,183 @@ private class WebRtcScreenShareClient(
         pc.createOffer(object : org.webrtc.SdpObserver {
             override fun onCreateSuccess(sdp: SessionDescription?) {
                 if (sdp == null) return
-
-                val preferredSdp = sdp.description
-                                        .let { current ->
-                        if (hasH264SenderCodec) {
-                            current.preferCodec(codec = "H264", mediaType = "video")
-                        } else {
-                            current
-                        }
-                    }
-                val localDescription = SessionDescription(SessionDescription.Type.OFFER, preferredSdp)
-
+                val preferredSdp = if (hasH264SenderCodec)
+                    sdp.description.preferCodec("H264", "video")
+                else
+                    sdp.description
+                val local = SessionDescription(SessionDescription.Type.OFFER, preferredSdp)
                 pc.setLocalDescription(object : org.webrtc.SdpObserver {
                     override fun onCreateSuccess(p0: SessionDescription?) = Unit
                     override fun onSetSuccess() {
-                        sendMessage(
-                            JSONObject()
-                                .put("type", "offer")
-                                .put("sdp", localDescription.description)
-                                .toString()
-                        )
-                        log("INFO", if (hasH264SenderCodec) "Offer отправлен (audio=${if (ENABLE_MIC_AUDIO) "OPUS" else "OFF"}, video=H264 preferred)" else "Offer отправлен (audio=${if (ENABLE_MIC_AUDIO) "OPUS" else "OFF"}, video=H264 unavailable on this device/build)")
+                        sendMessage(JSONObject().put("type", "offer").put("sdp", local.description).toString())
+                        log("INFO", "Offer отправлен (video=${if (hasH264SenderCodec) "H264 preferred" else "fallback"}, audio=${if (ENABLE_MIC_AUDIO) "OPUS" else "OFF"})")
                     }
-
-                    override fun onCreateFailure(error: String?) = Unit
-
-                    override fun onSetFailure(error: String?) {
-                        log("ERROR", "setLocalDescription error: $error")
-                    }
-                }, localDescription)
+                    override fun onCreateFailure(e: String?) = Unit
+                    override fun onSetFailure(e: String?)    { log("ERROR", "setLocalDescription: $e") }
+                }, local)
             }
-
-            override fun onSetSuccess() = Unit
-
-            override fun onCreateFailure(error: String?) {
-                log("ERROR", "createOffer error: $error")
-            }
-
-            override fun onSetFailure(error: String?) = Unit
+            override fun onSetSuccess()                  = Unit
+            override fun onCreateFailure(e: String?)     { log("ERROR", "createOffer: $e") }
+            override fun onSetFailure(e: String?)        = Unit
         }, constraints)
     }
 
     private fun String.preferCodec(codec: String, mediaType: String): String {
         val lines = split("\r\n").toMutableList()
-        val mediaPrefix = "m=$mediaType "
-        val mediaLineIndex = lines.indexOfFirst { it.startsWith(mediaPrefix) }
-        if (mediaLineIndex == -1) {
-            return this
-        }
+        val mediaLineIndex = lines.indexOfFirst { it.startsWith("m=$mediaType ") }
+        if (mediaLineIndex == -1) return this
 
         val codecRegex = Regex("^a=rtpmap:(\\d+)\\s+${Regex.escape(codec)}/", RegexOption.IGNORE_CASE)
-        val preferredPayloads = lines.mapNotNull { line ->
-            codecRegex.find(line)?.groupValues?.get(1)
-        }
+        val preferred = lines.mapNotNull { codecRegex.find(it)?.groupValues?.get(1) }
+        if (preferred.isEmpty()) return this
 
-        if (preferredPayloads.isEmpty()) {
-            return this
-        }
+        val parts = lines[mediaLineIndex].split(" ").toMutableList()
+        if (parts.size <= 3) return this
 
-        val mediaParts = lines[mediaLineIndex].split(" ").toMutableList()
-        if (mediaParts.size <= 3) {
-            return this
-        }
-
-        val currentPayloads = mediaParts.subList(3, mediaParts.size).toList()
-        val reorderedPayloads = buildList {
-            addAll(preferredPayloads.filter { it in currentPayloads })
-            addAll(currentPayloads.filter { it !in preferredPayloads })
-        }
-
-        val updatedMediaLine = (mediaParts.take(3) + reorderedPayloads).joinToString(" ")
-        lines[mediaLineIndex] = updatedMediaLine
-
+        val current = parts.subList(3, parts.size).toList()
+        val reordered = preferred.filter { it in current } + current.filter { it !in preferred }
+        lines[mediaLineIndex] = (parts.take(3) + reordered).joinToString(" ")
         return lines.joinToString("\r\n")
     }
 
     private fun handleSignalingPayload(payload: String) {
         executor.execute {
             val trimmed = payload.trim()
-            if (trimmed.isEmpty()) {
+            if (trimmed.isEmpty()) return@execute
+
+            if (trimmed.equals("ping", ignoreCase = true) || trimmed.equals("pong", ignoreCase = true)) {
+                log("INFO", "Keepalive: $trimmed")
                 return@execute
             }
 
-            if (trimmed.equals("ping", ignoreCase = true) ||
-                trimmed.equals("pong", ignoreCase = true)
-            ) {
-                log("INFO", "Получен keepalive: $trimmed")
-                return@execute
-            }
-
-            val chunks = if (trimmed.contains("\n")) {
-                trimmed
-                    .lineSequence()
-                    .map { it.trim() }
-                    .filter { it.isNotEmpty() }
-                    .toList()
-            } else {
+            val chunks = if (trimmed.contains("\n"))
+                trimmed.lineSequence().map { it.trim() }.filter { it.isNotEmpty() }.toList()
+            else
                 listOf(trimmed)
-            }
 
             var parsedAny = false
             for (chunk in chunks) {
                 val message = runCatching {
-                    val parsed = JSONTokener(chunk).nextValue()
-                    asJsonObject(parsed)
+                    asJsonObject(JSONTokener(chunk).nextValue())
                 }.getOrNull()
 
                 if (message == null) {
                     log("WARN", "Невалидный JSON: ${chunk.take(300)}")
                     continue
                 }
-
                 parsedAny = true
                 processSignalingMessage(message)
             }
 
-            if (!parsedAny) {
-                val preview = trimmed.take(200)
-                log("WARN", "Получен невалидный signaling payload: $preview")
-            }
+            if (!parsedAny) log("WARN", "Невалидный signaling payload: ${trimmed.take(200)}")
         }
     }
 
-    private fun asJsonObject(value: Any?): JSONObject? {
-        return when (value) {
-            is JSONObject -> value
-            is JSONArray -> arrayPairsToObject(value)
-            else -> null
-        }
+    private fun asJsonObject(value: Any?): JSONObject? = when (value) {
+        is JSONObject -> value
+        is JSONArray  -> arrayPairsToObject(value)
+        else          -> null
     }
 
     private fun arrayPairsToObject(array: JSONArray): JSONObject? {
         val result = JSONObject()
         for (i in 0 until array.length()) {
-            val pairAny = array.opt(i)
-            if (pairAny !is JSONArray || pairAny.length() < 2) {
-                return null
-            }
-
-            val key = pairAny.optString(0)
-            if (key.isBlank()) {
-                return null
-            }
-
-            val rawValue = pairAny.opt(1)
-            val normalizedValue = when (rawValue) {
-                is JSONArray -> asJsonObject(rawValue) ?: rawValue
-                else -> rawValue
-            }
-
-            result.put(key, normalizedValue)
+            val pair = array.opt(i)
+            if (pair !is JSONArray || pair.length() < 2) return null
+            val key = pair.optString(0)
+            if (key.isBlank()) return null
+            val raw = pair.opt(1)
+            result.put(key, if (raw is JSONArray) asJsonObject(raw) ?: raw else raw)
         }
         return result
     }
 
     private fun processSignalingMessage(message: JSONObject) {
-        val type = message.optString("type")
-        when (type) {
+        when (val type = message.optString("type")) {
+
+            "access-granted" -> {
+                log("INFO", "Доступ разрешён сервером (access-granted)")
+                accessState = AccessState.GRANTED
+                createPeerConnectionIfNeeded()
+                dispatchMain(onConnected)
+            }
+
+            "access-denied" -> {
+                log("WARN", "Доступ отклонён сервером (access-denied)")
+                accessState = AccessState.IDLE
+                dispatchMain(onAccessDenied)
+                cleanupConnection()
+            }
+
             "answer" -> {
-                val sdp = message.optString("sdp")
-                if (sdp.isBlank()) {
-                    log("WARN", "Пустой SDP answer")
+                if (accessState != AccessState.GRANTED) {
+                    log("WARN", "Получен answer до access-granted — игнорируем")
                     return
                 }
-                val answer = SessionDescription(SessionDescription.Type.ANSWER, sdp)
+                val sdp = message.optString("sdp")
+                if (sdp.isBlank()) { log("WARN", "Пустой SDP answer"); return }
                 peerConnection?.setRemoteDescription(object : org.webrtc.SdpObserver {
                     override fun onCreateSuccess(p0: SessionDescription?) = Unit
                     override fun onSetSuccess() {
                         log("INFO", "Remote answer установлен")
                         flushPendingCandidates()
                     }
-
-                    override fun onCreateFailure(error: String?) = Unit
-                    override fun onSetFailure(error: String?) {
-                        log("ERROR", "setRemoteDescription error: $error")
-                    }
-                }, answer)
+                    override fun onCreateFailure(e: String?) = Unit
+                    override fun onSetFailure(e: String?)    { log("ERROR", "setRemoteDescription: $e") }
+                }, SessionDescription(SessionDescription.Type.ANSWER, sdp))
             }
 
             "ice-candidate" -> {
-                val candidateJson = message.optJSONObject("candidate") ?: run {
-                    log("WARN", "Пустой ICE candidate")
+                if (accessState != AccessState.GRANTED) {
+                    log("WARN", "Получен ICE до access-granted — игнорируем")
                     return
                 }
+                val cj = message.optJSONObject("candidate") ?: run { log("WARN", "Пустой ICE candidate"); return }
                 val candidate = IceCandidate(
-                    candidateJson.optString("sdpMid"),
-                    candidateJson.optInt("sdpMLineIndex", 0),
-                    candidateJson.optString("candidate")
+                    cj.optString("sdpMid"),
+                    cj.optInt("sdpMLineIndex", 0),
+                    cj.optString("candidate")
                 )
-
                 val pc = peerConnection
                 if (pc?.remoteDescription == null) {
                     pendingRemoteCandidates.add(candidate)
-                    log("INFO", "ICE candidate поставлен в очередь")
+                    log("INFO", "ICE поставлен в очередь")
                 } else {
-                    val ok = pc.addIceCandidate(candidate)
-                    log("INFO", "ICE candidate применен: $ok")
+                    log("INFO", "ICE применён: ${pc.addIceCandidate(candidate)}")
                 }
             }
 
-            else -> log("WARN", "Неизвестный сигналинг-тип: $type")
+            else -> log("WARN", "Неизвестный тип: $type")
         }
     }
 
     private fun flushPendingCandidates() {
         val pc = peerConnection ?: return
-        pendingRemoteCandidates.forEach { candidate ->
-            val added = pc.addIceCandidate(candidate)
-            log("INFO", "Queued candidate applied: $added")
-        }
+        pendingRemoteCandidates.forEach { log("INFO", "Queued candidate: ${pc.addIceCandidate(it)}") }
         pendingRemoteCandidates.clear()
     }
 
     private fun sendIceCandidate(candidate: IceCandidate) {
-        val json = JSONObject()
-            .put("type", "ice-candidate")
-            .put(
-                "candidate",
-                JSONObject()
+        sendMessage(
+            JSONObject()
+                .put("type", "ice-candidate")
+                .put("candidate", JSONObject()
                     .put("candidate", candidate.sdp)
                     .put("sdpMid", candidate.sdpMid)
-                    .put("sdpMLineIndex", candidate.sdpMLineIndex)
-            )
-
-        sendMessage(json.toString())
+                    .put("sdpMLineIndex", candidate.sdpMLineIndex))
+                .toString()
+        )
     }
 
     private fun sendMessage(message: String) {
-        val ws = webSocket
-        if (ws == null) {
-            log("ERROR", "WebSocket не подключен")
-            return
-        }
-        ws.send(message)
+        webSocket?.send(message) ?: log("ERROR", "WebSocket не подключен")
     }
 
     private fun cleanupConnection() {
         executor.execute {
             runCatching { webSocket?.close(1000, "client cleanup") }
             webSocket = null
+            accessState = AccessState.IDLE
             pendingRemoteCandidates.clear()
             stopStreaming()
             dispatchMain(onDisconnected)
