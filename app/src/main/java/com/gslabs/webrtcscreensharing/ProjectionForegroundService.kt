@@ -46,9 +46,16 @@ class ProjectionForegroundService : Service() {
         return START_NOT_STICKY
     }
 
+    override fun onDestroy() {
+        super.onDestroy()
+        // Гарантируем, что сервис корректно останавливается
+        stopForeground(STOP_FOREGROUND_REMOVE)
+    }
+
     private fun ensureChannel() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
-        val manager = getSystemService(NotificationManager::class.java)
+        val manager = getSystemService(NotificationManager::class.java) ?: return
+        if (manager.getNotificationChannel(CHANNEL_ID) != null) return // уже создан
         val channel = NotificationChannel(
             CHANNEL_ID,
             "Screen sharing",
@@ -62,8 +69,10 @@ class ProjectionForegroundService : Service() {
     companion object {
         private const val CHANNEL_ID = "screen_share_channel"
         private const val NOTIFICATION_ID = 12001
-        private const val ACTION_START = "com.gslabs.webrtcscreensharing.action.START_PROJECTION_SERVICE"
-        private const val ACTION_STOP = "com.gslabs.webrtcscreensharing.action.STOP_PROJECTION_SERVICE"
+        private const val ACTION_START =
+            "com.gslabs.webrtcscreensharing.action.START_PROJECTION_SERVICE"
+        private const val ACTION_STOP =
+            "com.gslabs.webrtcscreensharing.action.STOP_PROJECTION_SERVICE"
 
         fun start(context: Context) {
             val intent = Intent(context, ProjectionForegroundService::class.java).apply {
