@@ -563,6 +563,7 @@ private class WebRtcScreenShareClient(
 
             createAndSendOffer(pc)
             dispatchMain { onStreamingChanged(true) }
+
             log("INFO", "Трансляция экрана запущена (video=true, mic=$enableMicAudio, systemAudio=${enableSystemAudio && mediaProjection != null})")
         }
     }
@@ -843,6 +844,12 @@ private class WebRtcScreenShareClient(
         }
 
         val parameters = videoSender.parameters
+
+        // Для screen sharing: при недостатке полосы лучше снижать fps, чем разрешение.
+        // Текст и UI-элементы теряют читаемость при снижении разрешения.
+        parameters.degradationPreference =
+            org.webrtc.RtpParameters.DegradationPreference.MAINTAIN_RESOLUTION
+
         val encodings = parameters.encodings
         if (encodings.isNullOrEmpty()) {
             log("WARN", "Video sender has no encodings")
@@ -852,14 +859,37 @@ private class WebRtcScreenShareClient(
         encodings.forEachIndexed { index, encoding ->
             encoding.maxBitrateBps = TARGET_VIDEO_MAX_BITRATE_BPS
             encoding.minBitrateBps = TARGET_VIDEO_MIN_BITRATE_BPS
-            // НЕ задаём maxFramerate — WebRTC сам управляет fps через bandwidth estimation.
-            // Принудительный maxFramerate в сочетании с minBitrateBps может вызвать
-            // конфликт: estimator хочет снизить fps для экономии, но ему не дают.
             log("INFO", "Encoding[$index]: min=${encoding.minBitrateBps}, max=${encoding.maxBitrateBps}")
         }
 
         val success = videoSender.setParameters(parameters)
-        log("INFO", "Bitrate applied=$success")
+        log("INFO", "Bitrate params applied=$success, degradation=MAINTAIN_RESOLUTION")
+    }
+
+    /**
+     * Вставляет x-google-max-keyframe-interval в fmtp-строки H264 в SDP.
+     *
+     * Это говорит аппаратному энкодеру генерировать I-frame каждые N видео-фреймов.
+     * При 30fps: 90 фреймов = 3 секунды.
+     *
+     * Преимущество перед PLI: не зависит от сети. Энкодер сам генерирует keyframe,
+     * даже если RTCP-канал потерян. Overhead минимальный: один I-frame (~20KB)
+     * каждые 3 секунды = ~53 kbps.
+     */
+    private fun String.setKeyframeInterval(maxFrames: Int): String {
+        val param = "x-google-max-keyframe-interval=$maxFrames"
+        val lines = split("\r\n").toMutableList()
+        for (i in lines.indices) {
+            val line = lines[i]
+            // Ищем fmtp-строки для H264 payload types
+            if (line.startsWith("a=fmtp:") && !line.contains(param)) {
+                // Проверяем что это H264: ищем profile-level-id (есть только у H264)
+                if (line.contains("profile-level-id")) {
+                    lines[i] = "$line;$param"
+                }
+            }
+        }
+        return lines.joinToString("\r\n")
     }
 
 
@@ -877,16 +907,24 @@ private class WebRtcScreenShareClient(
         pc.createOffer(object : org.webrtc.SdpObserver {
             override fun onCreateSuccess(sdp: SessionDescription?) {
                 if (sdp == null) return
-                val preferredSdp = if (hasH264SenderCodec)
-                    sdp.description.preferCodec("H264", "video")
-                else
-                    sdp.description
-                val local = SessionDescription(SessionDescription.Type.OFFER, preferredSdp)
+                var mungedSdp = sdp.description
+
+                // Предпочтение H264 если доступен
+                if (hasH264SenderCodec) {
+                    mungedSdp = mungedSdp.preferCodec("H264", "video")
+                }
+
+                // Периодический keyframe каждые 90 фреймов (~3 секунды при 30fps).
+                // Критично для WiFi: потеря одного P-frame ломает весь последующий поток,
+                // а без keyframe interval энкодер работает с i-frame-interval=3600 (1 час).
+                mungedSdp = mungedSdp.setKeyframeInterval(90)
+
+                val local = SessionDescription(SessionDescription.Type.OFFER, mungedSdp)
                 pc.setLocalDescription(object : org.webrtc.SdpObserver {
                     override fun onCreateSuccess(p0: SessionDescription?) = Unit
                     override fun onSetSuccess() {
                         sendMessage(JSONObject().put("type", "offer").put("sdp", local.description).toString())
-                        log("INFO", "Offer отправлен (video=${if (hasH264SenderCodec) "H264" else "fallback"})")
+                        log("INFO", "Offer отправлен (video=${if (hasH264SenderCodec) "H264" else "fallback"}, keyframeInterval=90)")
                     }
                     override fun onCreateFailure(e: String?) = Unit
                     override fun onSetFailure(e: String?) { log("ERROR", "setLocalDescription: $e") }

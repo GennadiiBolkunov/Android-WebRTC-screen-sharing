@@ -18,29 +18,6 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.atomic.AtomicBoolean
 
-/**
- * Захват системного аудио через AudioPlaybackCapture API (Android 10+).
- *
- * АРХИТЕКТУРА АУДИО В WebRTC
- * ==========================
- * Стандартный WebRTC Android SDK (google-webrtc AAR) НЕ поддерживает инъекцию
- * произвольных PCM-данных в аудио-трек. JavaAudioDeviceModule жёстко привязан
- * к AudioRecord с микрофона.
- *
- * Для прототипа: системное аудио захватывается этим классом и передаётся
- * на STB через WebRTC DataChannel (бинарные PCM-фреймы).
- * STB декодирует и воспроизводит их параллельно с WebRTC аудио-треком (микрофон).
- *
- * Для продакшена: необходимо собрать libwebrtc из исходников с кастомным
- * AudioDeviceModule, который будет микшировать системное аудио и микрофон
- * в единый RTP-поток.
- *
- * ОГРАНИЧЕНИЯ AudioPlaybackCapture (Android 10+):
- * - Приложения могут запретить захват через setAllowedCapturePolicy(ALLOW_CAPTURE_BY_NONE)
- * - Захватывается только аудио с USAGE_MEDIA, USAGE_GAME, USAGE_UNKNOWN
- * - Требуется активная MediaProjection с foreground service
- */
-
 private const val TAG = "SystemAudioCapturer"
 
 /** Частота дискретизации: 48 кГц — стандарт для Opus/WebRTC */
@@ -60,19 +37,20 @@ const val FRAME_SIZE_SAMPLES = 960 // 48000 * 0.020
 const val FRAME_SIZE_BYTES = FRAME_SIZE_SAMPLES * 2 * AUDIO_CHANNELS
 
 /**
- * Callback для получения PCM-фреймов.
+ * Callback для получения аудио-фреймов.
  * Вызывается из рабочего потока, НЕ из main thread.
  *
- * @param pcmData   — 16-bit PCM little-endian, [AUDIO_CHANNELS] каналов, [AUDIO_SAMPLE_RATE] Hz
- * @param sizeBytes — фактическое количество байт в массиве
+ * @param data      — Opus-пакет (если encodeOpus=true) или PCM S16LE (если false)
+ * @param sizeBytes — фактическое количество байт
  */
-typealias AudioFrameCallback = (pcmData: ByteArray, sizeBytes: Int) -> Unit
+typealias AudioFrameCallback = (data: ByteArray, sizeBytes: Int) -> Unit
 
 @RequiresApi(Build.VERSION_CODES.Q)
 class SystemAudioCapturer(
     private val context: Context,
     private val mediaProjection: MediaProjection,
     private val enableMic: Boolean = false,
+    private val encodeOpus: Boolean = true,
     private val onFrame: AudioFrameCallback,
     private val onError: (String) -> Unit = {}
 ) {
@@ -80,15 +58,24 @@ class SystemAudioCapturer(
 
     private var systemAudioRecord: AudioRecord? = null
     private var micAudioRecord: AudioRecord? = null
+    private var opusEncoder: OpusEncoder? = null
     private var captureThread: Thread? = null
 
-    /**
-     * Запускает захват. Возвращает true, если захват успешно стартовал.
-     */
     fun start(): Boolean {
         if (running.getAndSet(true)) {
             onError("Захват уже запущен")
             return false
+        }
+
+        // --- Opus кодирование ---
+        if (encodeOpus) {
+            val encoder = OpusEncoder(AUDIO_SAMPLE_RATE, AUDIO_CHANNELS)
+            if (encoder.start()) {
+                opusEncoder = encoder
+                Log.i(TAG, "Opus encoding enabled (${OpusEncoder.OPUS_BITRATE_BPS / 1000} kbps)")
+            } else {
+                Log.w(TAG, "Opus encoder unavailable, falling back to raw PCM")
+            }
         }
 
         // --- Системное аудио через AudioPlaybackCapture ---
@@ -97,13 +84,15 @@ class SystemAudioCapturer(
         } catch (e: Exception) {
             Log.e(TAG, "Не удалось создать AudioRecord для системного аудио", e)
             onError("AudioPlaybackCapture недоступен: ${e.message}")
+            opusEncoder?.stop(); opusEncoder = null
             running.set(false)
             return false
         }
 
         if (systemRecord.state != AudioRecord.STATE_INITIALIZED) {
-            onError("AudioRecord для системного аудио не инициализирован (state=${systemRecord.state})")
+            onError("AudioRecord для системного аудио не инициализирован")
             systemRecord.release()
+            opusEncoder?.stop(); opusEncoder = null
             running.set(false)
             return false
         }
@@ -117,40 +106,32 @@ class SystemAudioCapturer(
             ) {
                 micRecord = try {
                     createMicAudioRecord()
-                } catch (e: SecurityException) {
-                    Log.w(TAG, "Нет разрешения на микрофон", e)
-                    onError("Микрофон недоступен: нет разрешения RECORD_AUDIO")
-                    null
                 } catch (e: Exception) {
-                    Log.w(TAG, "Не удалось создать AudioRecord для микрофона", e)
+                    Log.w(TAG, "Микрофон недоступен", e)
                     onError("Микрофон недоступен: ${e.message}")
                     null
                 }
-
                 if (micRecord != null && micRecord.state != AudioRecord.STATE_INITIALIZED) {
-                    onError("AudioRecord для микрофона не инициализирован")
-                    micRecord.release()
-                    micRecord = null
+                    micRecord.release(); micRecord = null
                 }
-            } else {
-                onError("Микрофон пропущен: нет разрешения RECORD_AUDIO")
             }
         }
         micAudioRecord = micRecord
 
-        // --- Запуск потока захвата ---
         captureThread = Thread({
             android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
             captureLoop(systemRecord, micRecord)
         }, "SystemAudioCaptureThread").also { it.start() }
 
-        Log.i(TAG, "Захват запущен (system=true, mic=${micRecord != null})")
+        Log.i(TAG, "Захват запущен (system=true, mic=${micRecord != null}, opus=${opusEncoder != null})")
         return true
     }
 
+    /** true если Opus-кодирование активно (определяется после start()) */
+    val isOpusEncoding: Boolean get() = opusEncoder != null
+
     fun stop() {
         if (!running.getAndSet(false)) return
-
         captureThread?.interrupt()
         captureThread?.join(2000)
         captureThread = null
@@ -160,11 +141,11 @@ class SystemAudioCapturer(
         systemAudioRecord = null
         micAudioRecord = null
 
+        opusEncoder?.stop()
+        opusEncoder = null
         Log.i(TAG, "Захват остановлен")
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Внутренняя реализация
     // ─────────────────────────────────────────────────────────────────────────
 
     @RequiresPermission(Manifest.permission.RECORD_AUDIO)
@@ -182,43 +163,29 @@ class SystemAudioCapturer(
             .setChannelMask(AUDIO_CHANNEL_MASK_IN)
             .build()
 
-        val minBufSize = AudioRecord.getMinBufferSize(
-            AUDIO_SAMPLE_RATE, AUDIO_CHANNEL_MASK_IN, AUDIO_ENCODING
-        )
-        // Буфер ≥ 4 фрейма для устойчивости
-        val bufferSize = maxOf(minBufSize, FRAME_SIZE_BYTES * 4)
-
+        val minBufSize = AudioRecord.getMinBufferSize(AUDIO_SAMPLE_RATE, AUDIO_CHANNEL_MASK_IN, AUDIO_ENCODING)
         return AudioRecord.Builder()
             .setAudioPlaybackCaptureConfig(captureConfig)
             .setAudioFormat(audioFormat)
-            .setBufferSizeInBytes(bufferSize)
+            .setBufferSizeInBytes(maxOf(minBufSize, FRAME_SIZE_BYTES * 4))
             .build()
     }
 
-    @Suppress("MissingPermission") // разрешение проверяется выше
+    @Suppress("MissingPermission")
     private fun createMicAudioRecord(): AudioRecord {
-        val minBufSize = AudioRecord.getMinBufferSize(
-            AUDIO_SAMPLE_RATE, AUDIO_CHANNEL_MASK_IN, AUDIO_ENCODING
-        )
-        val bufferSize = maxOf(minBufSize, FRAME_SIZE_BYTES * 4)
-
+        val minBufSize = AudioRecord.getMinBufferSize(AUDIO_SAMPLE_RATE, AUDIO_CHANNEL_MASK_IN, AUDIO_ENCODING)
         return AudioRecord(
             MediaRecorder.AudioSource.VOICE_COMMUNICATION,
-            AUDIO_SAMPLE_RATE,
-            AUDIO_CHANNEL_MASK_IN,
-            AUDIO_ENCODING,
-            bufferSize
+            AUDIO_SAMPLE_RATE, AUDIO_CHANNEL_MASK_IN, AUDIO_ENCODING,
+            maxOf(minBufSize, FRAME_SIZE_BYTES * 4)
         )
     }
 
-    /**
-     * Основной цикл: читаем системное аудио, опционально микшируем с микрофоном,
-     * отправляем PCM-фрейм в callback.
-     */
     private fun captureLoop(systemRec: AudioRecord, micRec: AudioRecord?) {
         val systemBuf = ByteArray(FRAME_SIZE_BYTES)
         val micBuf = if (micRec != null) ByteArray(FRAME_SIZE_BYTES) else null
         val mixBuf = if (micRec != null) ByteArray(FRAME_SIZE_BYTES) else null
+        val encoder = opusEncoder
 
         try {
             systemRec.startRecording()
@@ -236,18 +203,30 @@ class SystemAudioCapturer(
                 onError("Ошибка чтения системного аудио: code=$systemRead")
                 break
             }
+            if (systemRead == 0) continue
+
+            val pcmData: ByteArray
+            val pcmSize: Int
 
             if (micRec != null && micBuf != null && mixBuf != null) {
                 val micRead = micRec.read(micBuf, 0, FRAME_SIZE_BYTES)
                 if (micRead > 0) {
-                    mixPcm16(systemBuf, micBuf, mixBuf, minOf(systemRead, micRead))
-                    onFrame(mixBuf, minOf(systemRead, micRead))
+                    val s = minOf(systemRead, micRead)
+                    mixPcm16(systemBuf, micBuf, mixBuf, s)
+                    pcmData = mixBuf; pcmSize = s
                 } else {
-                    // Микрофон не вернул данные — отправляем только системное аудио
-                    onFrame(systemBuf, systemRead)
+                    pcmData = systemBuf; pcmSize = systemRead
                 }
             } else {
-                onFrame(systemBuf, systemRead)
+                pcmData = systemBuf; pcmSize = systemRead
+            }
+
+            if (encoder != null) {
+                encoder.encode(pcmData, pcmSize) { opusPacket, opusSize ->
+                    onFrame(opusPacket, opusSize)
+                }
+            } else {
+                onFrame(pcmData, pcmSize)
             }
         }
 
@@ -255,41 +234,25 @@ class SystemAudioCapturer(
         if (micRec != null) safeStop(micRec, "mic")
     }
 
-    /**
-     * Микширование двух 16-bit PCM буферов с клиппингом.
-     * Результат записывается в [out].
-     */
     private fun mixPcm16(a: ByteArray, b: ByteArray, out: ByteArray, sizeBytes: Int) {
         val bbA = ByteBuffer.wrap(a).order(ByteOrder.LITTLE_ENDIAN)
         val bbB = ByteBuffer.wrap(b).order(ByteOrder.LITTLE_ENDIAN)
         val bbOut = ByteBuffer.wrap(out).order(ByteOrder.LITTLE_ENDIAN)
-
         val samples = sizeBytes / 2
         for (i in 0 until samples) {
             val sA = bbA.getShort(i * 2).toInt()
             val sB = bbB.getShort(i * 2).toInt()
-            // Суммируем и клиппируем до Short.MIN_VALUE..Short.MAX_VALUE
-            val mixed = (sA + sB).coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
-            bbOut.putShort(i * 2, mixed.toShort())
+            bbOut.putShort(i * 2, (sA + sB).coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort())
         }
     }
 
     private fun safeStop(record: AudioRecord, label: String) {
-        try {
-            if (record.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
-                record.stop()
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "Ошибка остановки AudioRecord ($label)", e)
-        }
+        try { if (record.recordingState == AudioRecord.RECORDSTATE_RECORDING) record.stop() }
+        catch (e: Exception) { Log.w(TAG, "Ошибка остановки AudioRecord ($label)", e) }
     }
 
     private fun safeRelease(record: AudioRecord, label: String) {
-        try {
-            safeStop(record, label)
-            record.release()
-        } catch (e: Exception) {
-            Log.w(TAG, "Ошибка освобождения AudioRecord ($label)", e)
-        }
+        try { safeStop(record, label); record.release() }
+        catch (e: Exception) { Log.w(TAG, "Ошибка освобождения AudioRecord ($label)", e) }
     }
 }
