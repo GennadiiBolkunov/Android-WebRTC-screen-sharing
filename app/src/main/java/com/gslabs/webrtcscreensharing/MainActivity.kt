@@ -84,11 +84,11 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 private const val TAG = "WebRtcScreenShare"
-private const val TARGET_CAPTURE_WIDTH = 1280
-private const val TARGET_CAPTURE_HEIGHT = 720
-private const val TARGET_CAPTURE_FPS = 30
-private const val TARGET_VIDEO_MAX_BITRATE_BPS = 4_000_000
-private const val TARGET_VIDEO_MIN_BITRATE_BPS = 300_000  // Низкий min, чтобы bandwidth estimator мог свободно работать
+private const val TARGET_CAPTURE_WIDTH = 1920
+private const val TARGET_CAPTURE_HEIGHT = 1080
+private const val TARGET_CAPTURE_FPS = 60
+private const val TARGET_VIDEO_MAX_BITRATE_BPS = 30_000_000
+private const val TARGET_VIDEO_MIN_BITRATE_BPS = 4_000_000
 private const val USE_SOFTWARE_VIDEO_ENCODER = false
 
 class MainActivity : ComponentActivity() {
@@ -131,8 +131,8 @@ private fun ScreenShareApp(modifier: Modifier = Modifier) {
     val listState = rememberLazyListState()
 
     var state by remember { mutableStateOf(ConnectionState.DISCONNECTED) }
-    var wsUrl by remember { mutableStateOf("ws://192.168.0.137:8554") }
-    var enableMic by remember { mutableStateOf(true) }
+    var wsUrl by remember { mutableStateOf("ws://192.168.200.1:8554") }
+    var enableMic by remember { mutableStateOf(false) }
     var enableSystemAudio by remember { mutableStateOf(true) }
     var hasMicPermission by remember {
         mutableStateOf(
